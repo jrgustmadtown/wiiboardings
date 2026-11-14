@@ -135,15 +135,20 @@ void dumpKeyboard(ControllerPtr ctl) {
     Console.printf("\n");
 }
 
-void dumpBalanceBoard(ControllerPtr ctl) {
-    Console.printf("idx=%d,  TL=%u, TR=%u, BL=%u, BR=%u, temperature=%d\n",
-                   ctl->index(),        // Controller Index
-                   ctl->topLeft(),      // top-left scale
-                   ctl->topRight(),     // top-right scale
-                   ctl->bottomLeft(),   // bottom-left scale
-                   ctl->bottomRight(),  // bottom-right scale
-                   ctl->temperature()   // temperature: used to adjust the scale value's precision
-    );
+void dumpBalanceBoard(ControllerPtr ctl, uint32_t topLeft, uint32_t topRight, uint32_t bottomLeft,
+                      uint32_t bottomRight, const char* lean) {
+    const uint32_t left = topLeft + bottomLeft;
+    const uint32_t right = topRight + bottomRight;
+    const uint32_t front = topLeft + topRight;
+    const uint32_t back = bottomLeft + bottomRight;
+    const uint32_t total = topLeft + topRight + bottomLeft + bottomRight;
+
+    Console.printf("idx=%d, TL=%u g, TR=%u g, BL=%u g, BR=%u g, total=%lu g, left=%lu g, right=%lu g, front=%lu g, back=%lu g, lean=%s, temperature=%d\n",
+                   ctl->index(), static_cast<unsigned>(topLeft), static_cast<unsigned>(topRight),
+                   static_cast<unsigned>(bottomLeft), static_cast<unsigned>(bottomRight),
+                   static_cast<unsigned long>(total), static_cast<unsigned long>(left),
+                   static_cast<unsigned long>(right), static_cast<unsigned long>(front),
+                   static_cast<unsigned long>(back), lean, ctl->temperature());
 }
 
 void processGamepad(ControllerPtr ctl) {
@@ -239,13 +244,56 @@ void processKeyboard(ControllerPtr ctl) {
 }
 
 void processBalanceBoard(ControllerPtr ctl) {
-    // This is just an example.
-    if (ctl->topLeft() > 10000) {
-        // Do Something
+    constexpr uint32_t minimumLoadGrams = 300;
+    constexpr uint32_t minimumDeadzoneGrams = 200;
+    static bool initialized = false;
+    static uint32_t topLeft = 0;
+    static uint32_t topRight = 0;
+    static uint32_t bottomLeft = 0;
+    static uint32_t bottomRight = 0;
+
+    const uint32_t rawTopLeft = ctl->topLeft();
+    const uint32_t rawTopRight = ctl->topRight();
+    const uint32_t rawBottomLeft = ctl->bottomLeft();
+    const uint32_t rawBottomRight = ctl->bottomRight();
+
+    if (!initialized) {
+        topLeft = rawTopLeft;
+        topRight = rawTopRight;
+        bottomLeft = rawBottomLeft;
+        bottomRight = rawBottomRight;
+        initialized = true;
+    } else {
+        topLeft = (2 * topLeft + rawTopLeft) / 3;
+        topRight = (2 * topRight + rawTopRight) / 3;
+        bottomLeft = (2 * bottomLeft + rawBottomLeft) / 3;
+        bottomRight = (2 * bottomRight + rawBottomRight) / 3;
     }
 
-    // See "dumpBalanceBoard" for possible things to query.
-    dumpBalanceBoard(ctl);
+    const uint32_t left = topLeft + bottomLeft;
+    const uint32_t right = topRight + bottomRight;
+    const uint32_t front = topLeft + topRight;
+    const uint32_t back = bottomLeft + bottomRight;
+    const uint32_t total = left + right;
+    const int32_t leftRightShift = static_cast<int32_t>(right) - static_cast<int32_t>(left);
+    const int32_t frontBackShift = static_cast<int32_t>(front) - static_cast<int32_t>(back);
+    const uint32_t deadzone = total / 8 > minimumDeadzoneGrams ? total / 8 : minimumDeadzoneGrams;
+    const int32_t leftRightMagnitude = leftRightShift < 0 ? -leftRightShift : leftRightShift;
+    const int32_t frontBackMagnitude = frontBackShift < 0 ? -frontBackShift : frontBackShift;
+
+    const char* lean = "NO LOAD";
+    if (total >= minimumLoadGrams) {
+        if (leftRightMagnitude <= static_cast<int32_t>(deadzone) &&
+            frontBackMagnitude <= static_cast<int32_t>(deadzone)) {
+            lean = "CENTER";
+        } else if (leftRightMagnitude >= frontBackMagnitude) {
+            lean = leftRightShift > 0 ? "RIGHT" : "LEFT";
+        } else {
+            lean = frontBackShift > 0 ? "FRONT" : "BACK";
+        }
+    }
+
+    dumpBalanceBoard(ctl, topLeft, topRight, bottomLeft, bottomRight, lean);
 }
 
 void processControllers() {
