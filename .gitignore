@@ -4,6 +4,7 @@ sdkconfig
 
 # misc
 .pioenvs
+.pio/
 .clang_complete
 .gcc-flags.json
 
@@ -55,3 +56,5 @@ ui_*.h
 
 # Vagrant stuff
 .vagrant
+
+/managed_components/
