@@ -6,32 +6,305 @@
 
 #include <Arduino.h>
 #include <Bluepad32.h>
-
-//
-// README FIRST, README FIRST, README FIRST
-//
-// Bluepad32 has a built-in interactive console.
-// By default, it is enabled (hey, this is a great feature!).
-// But it is incompatible with Arduino "Serial" class.
-//
-// Instead of using "Serial" you can use Bluepad32 "Console" class instead.
-// It is somewhat similar to Serial but not exactly the same.
-//
-// Should you want to still use "Serial", you have to disable the Bluepad32's console
-// from "sdkconfig.defaults" with:
-//    CONFIG_BLUEPAD32_USB_CONSOLE_ENABLE=n
+#include <esp_console.h>
+#include <math.h>
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
-// This callback gets called any time a new gamepad is connected.
-// Up to 4 gamepads can be connected at the same time.
+enum class DominantSide : uint8_t { None, Left, Right };
+
+struct MotorPulses {
+    uint32_t leftUs;
+    uint32_t rightUs;
+};
+
+// Pin 0 = Left Motor (GPIO 18), Pin 1 = Right Motor (GPIO 19)
+constexpr uint8_t kLeftMotorPin = 26;
+constexpr uint8_t kRightMotorPin = 27;
+constexpr uint8_t kMotorPwmPins[] = {kLeftMotorPin, kRightMotorPin};
+
+constexpr uint32_t kMotorPwmFrequencyHz = 50;
+constexpr uint8_t kMotorPwmResolutionBits = 16;
+constexpr uint32_t kMotorPwmPeriodUs = 1000000UL / kMotorPwmFrequencyHz;
+constexpr uint32_t kMinimumReversePulseUs = 1000;
+constexpr uint32_t kNeutralPulseUs = 1500;
+constexpr uint32_t kMaximumForwardPulseUs = 2000;
+
+// Differential steering tuning
+constexpr float kMaxTiltDegrees = 60.0f;           // Tilt angle for full steering authority
+constexpr float kSteeringDeadzoneDegrees = 5.0f;   // Ignore small hand jitters
+constexpr int32_t kMaxSteeringOffsetUs = 250;      // Max differential offset added/subtracted per wheel
+constexpr bool kInvertSteering = false;            // Flip to true if left/right turns are reversed
+
+constexpr uint32_t kMinimumStepLoadGrams = 10000;
+constexpr uint32_t kStepSidePercent = 75;
+constexpr uint32_t kStepWindowMs = 1000;
+constexpr uint32_t kLevelUpIntervalMs = 500;
+constexpr uint32_t kLevelDownIntervalMs = 250;
+constexpr uint32_t kBalanceBoardTimeoutMs = 1000;
+constexpr uint32_t kMonitorOutputIntervalMs = 800;
+constexpr uint8_t kMaximumSpeedLevel = 10;
+constexpr uint32_t kPwmBenchTestPulseUs = 1600;
+constexpr uint32_t kPwmBenchTestPulseMs = 300;
+constexpr int32_t kMaxLeanThrottleOffsetUs = 500;  
+constexpr int32_t kMaxLeanSteeringOffsetUs = 250;
+
+static bool motorPwmReady = false;
+static bool pwmBenchTestActive = false;
+static bool balanceBoardOccupied = false;
+static bool systemEnabled = false;
+static bool leanModeEnabled = false;
+static int32_t leanFrontBackOffsetUs = 0;          
+static int32_t leanLeftRightOffsetUs = 0;
+static uint8_t currentSpeedLevel = 0;
+static uint32_t lastSpeedLevelChangeAt = 0;
+static uint32_t lastBalanceBoardDataAt = 0;
+static DominantSide lastCountedSide = DominantSide::None;
+static uint32_t totalStepCount = 0;
+static uint32_t recentStepTimes[kMaximumSpeedLevel] = {};
+static uint8_t recentStepCount = 0;
+static uint8_t nextStepSlot = 0;
+static uint32_t lastMonitorPrintAt[BP32_MAX_GAMEPADS] = {};
+static bool hasMonitorPrinted[BP32_MAX_GAMEPADS] = {};
+static float currentTiltDegrees = 0.0f;
+
+bool shouldPrintControllerMonitor(ControllerPtr ctl, bool force = false) {
+    const uint8_t index = ctl->index();
+    if (index >= BP32_MAX_GAMEPADS) {
+        return true;
+    }
+
+    const uint32_t now = millis();
+    if (!force && hasMonitorPrinted[index] && now - lastMonitorPrintAt[index] < kMonitorOutputIntervalMs) {
+        return false;
+    }
+
+    hasMonitorPrinted[index] = true;
+    lastMonitorPrintAt[index] = now;
+    return true;
+}
+
+MotorPulses computeLeanPulses(bool isOccupied) {
+    if (!systemEnabled || !isOccupied) {
+        return {kNeutralPulseUs, kNeutralPulseUs};
+    }
+
+    const int32_t rawLeftUs =
+        static_cast<int32_t>(kNeutralPulseUs) + leanFrontBackOffsetUs + leanLeftRightOffsetUs;
+    const int32_t rawRightUs =
+        static_cast<int32_t>(kNeutralPulseUs) + leanFrontBackOffsetUs - leanLeftRightOffsetUs;
+
+    MotorPulses pulses;
+    pulses.leftUs = constrain(rawLeftUs, kMinimumReversePulseUs, kMaximumForwardPulseUs);
+    pulses.rightUs = constrain(rawRightUs, kMinimumReversePulseUs, kMaximumForwardPulseUs);
+    return pulses;
+}
+
+MotorPulses computeDifferentialPulses(uint8_t speedLevel, float tiltDegrees, bool isOccupied) {
+    
+    if (!systemEnabled || !isOccupied) {
+        return {kNeutralPulseUs, kNeutralPulseUs};
+    }
+
+    if (speedLevel > kMaximumSpeedLevel) {
+        speedLevel = kMaximumSpeedLevel;
+    }
+
+    // 1. Base forward throttle from Balance Board cadence
+    const int32_t baseThrottleUs =
+        kNeutralPulseUs +
+        static_cast<int32_t>((kMaximumForwardPulseUs - kNeutralPulseUs) * speedLevel / kMaximumSpeedLevel);
+
+    // 2. Apply deadzone and clamp tilt angle
+    if (fabsf(tiltDegrees) < kSteeringDeadzoneDegrees) {
+        tiltDegrees = 0.0f;
+    } else if (tiltDegrees > 0.0f) {
+        tiltDegrees -= kSteeringDeadzoneDegrees;
+    } else {
+        tiltDegrees += kSteeringDeadzoneDegrees;
+    }
+
+    const float effectiveMaxTilt = kMaxTiltDegrees - kSteeringDeadzoneDegrees;
+    tiltDegrees = constrain(tiltDegrees, -effectiveMaxTilt, effectiveMaxTilt);
+
+    if (kInvertSteering) {
+        tiltDegrees = -tiltDegrees;
+    }
+
+    // 3. Calculate differential offset (-kMaxSteeringOffsetUs to +kMaxSteeringOffsetUs)
+    const int32_t steeringOffsetUs =
+        static_cast<int32_t>((tiltDegrees / effectiveMaxTilt) * kMaxSteeringOffsetUs);
+
+    // 4. Mix throttle and steering:
+    // Turning Right (positive offset) -> Left wheel speeds up, Right wheel slows down
+    // Turning Left (negative offset)  -> Left wheel slows down, Right wheel speeds up
+    int32_t rawLeftUs = baseThrottleUs + steeringOffsetUs;
+    int32_t rawRightUs = baseThrottleUs - steeringOffsetUs;
+    
+
+    MotorPulses pulses;
+    pulses.leftUs = constrain(rawLeftUs, kMinimumReversePulseUs, kMaximumForwardPulseUs);
+    pulses.rightUs = constrain(rawRightUs, kMinimumReversePulseUs, kMaximumForwardPulseUs);
+    return pulses;
+}
+
+MotorPulses computeActivePulses() {
+    if (leanModeEnabled) {
+        return computeLeanPulses(balanceBoardOccupied);
+    }
+    return computeDifferentialPulses(currentSpeedLevel, currentTiltDegrees, balanceBoardOccupied);
+}
+
+void writeMotorPinPulseUs(uint8_t pin, uint32_t pulseUs) {
+    if (!motorPwmReady) {
+        return;
+    }
+    pulseUs = constrain(pulseUs, kMinimumReversePulseUs, kMaximumForwardPulseUs);
+
+    const uint32_t maximumDuty = (1UL << kMotorPwmResolutionBits) - 1;
+    const uint32_t duty = static_cast<uint32_t>(
+        static_cast<uint64_t>(pulseUs) * maximumDuty / kMotorPwmPeriodUs);
+    ledcWrite(pin, duty);
+}
+
+void writeMotorPulses(MotorPulses pulses) {
+    if (pwmBenchTestActive) {
+        return;
+    }
+    writeMotorPinPulseUs(kLeftMotorPin, pulses.leftUs);
+    writeMotorPinPulseUs(kRightMotorPin, pulses.rightUs);
+}
+
+void writeNeutralPulses() {
+    writeMotorPinPulseUs(kLeftMotorPin, kNeutralPulseUs);
+    writeMotorPinPulseUs(kRightMotorPin, kNeutralPulseUs);
+}
+
+void setupMotorPwm() {
+    const bool firstPinReady = ledcAttach(kLeftMotorPin, kMotorPwmFrequencyHz, kMotorPwmResolutionBits);
+    const bool secondPinReady = ledcAttach(kRightMotorPin, kMotorPwmFrequencyHz, kMotorPwmResolutionBits);
+    motorPwmReady = firstPinReady && secondPinReady;
+    lastSpeedLevelChangeAt = millis();
+    if (motorPwmReady) {
+        writeNeutralPulses();
+    } else {
+        Console.println("Motor PWM initialization failed; outputs remain disabled");
+    }
+}
+
+void runPwmBenchTest() {
+    if (!motorPwmReady) {
+        return;
+    }
+    if (pwmBenchTestActive) {
+        Console.println("PWM bench test is already running");
+        return;
+    }
+
+    pwmBenchTestActive = true;
+    writeNeutralPulses();
+    for (uint8_t pin : kMotorPwmPins) {
+        Console.printf("PWM bench test: GPIO%u (%s), pulse=%lu us\n",
+                       static_cast<unsigned>(pin),
+                       pin == kLeftMotorPin ? "LEFT" : "RIGHT",
+                       static_cast<unsigned long>(kPwmBenchTestPulseUs));
+        writeMotorPinPulseUs(pin, kPwmBenchTestPulseUs);
+        delay(kPwmBenchTestPulseMs);
+        writeMotorPinPulseUs(pin, kNeutralPulseUs);
+        delay(500);
+    }
+    writeNeutralPulses();
+    pwmBenchTestActive = false;
+    Console.println("PWM bench test complete; outputs neutral");
+}
+
+static int pwmTestConsoleCommand(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+    runPwmBenchTest();
+    return 0;
+}
+
+static void registerPwmTestConsoleCommand() {
+    const esp_console_cmd_t command = {
+        .command = "pwm_test",
+        .help = "Pulse each motor output once at a low forward value",
+        .hint = nullptr,
+        .func = &pwmTestConsoleCommand,
+        .argtable = nullptr,
+    };
+    const esp_err_t result = esp_console_cmd_register(&command);
+    if (result != ESP_OK) {
+        Console.printf("Failed to register pwm_test command: %d\n", static_cast<int>(result));
+    }
+}
+
+void resetMotorOutput() {
+    balanceBoardOccupied = false;
+    leanFrontBackOffsetUs = 0; 
+    leanLeftRightOffsetUs = 0;
+    currentSpeedLevel = 0;
+    lastSpeedLevelChangeAt = millis();
+    lastBalanceBoardDataAt = 0;
+    lastCountedSide = DominantSide::None;
+    totalStepCount = 0;
+    recentStepCount = 0;
+    nextStepSlot = 0;
+    if (!pwmBenchTestActive) {
+        writeNeutralPulses();
+    }
+}
+
+void recordStep(uint32_t now) {
+    recentStepTimes[nextStepSlot] = now;
+    nextStepSlot = (nextStepSlot + 1) % kMaximumSpeedLevel;
+    if (recentStepCount < kMaximumSpeedLevel) {
+        recentStepCount++;
+    }
+    totalStepCount++;
+}
+
+uint8_t countRecentSteps(uint32_t now) {
+    uint8_t stepsInWindow = 0;
+    for (uint8_t i = 0; i < recentStepCount; i++) {
+        if (now - recentStepTimes[i] <= kStepWindowMs) {
+            stepsInWindow++;
+        }
+    }
+    return stepsInWindow;
+}
+
+void updateMotorSpeed(uint32_t now, uint8_t targetSpeedLevel) {
+    if (pwmBenchTestActive) {
+        return;
+    }
+    if (targetSpeedLevel > kMaximumSpeedLevel) {
+        targetSpeedLevel = kMaximumSpeedLevel;
+    }
+    if (targetSpeedLevel == currentSpeedLevel) {
+        return;
+    }
+
+    const uint32_t rampInterval = targetSpeedLevel > currentSpeedLevel ? kLevelUpIntervalMs
+                                                                       : kLevelDownIntervalMs;
+    if (now - lastSpeedLevelChangeAt < rampInterval) {
+        return;
+    }
+
+    if (targetSpeedLevel > currentSpeedLevel) {
+        currentSpeedLevel++;
+    } else {
+        currentSpeedLevel--;
+    }
+    lastSpeedLevelChangeAt = now;
+    writeMotorPulses(computeActivePulses());
+}
+
 void onConnectedController(ControllerPtr ctl) {
     bool foundEmptySlot = false;
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == nullptr) {
             Console.printf("CALLBACK: Controller is connected, index=%d\n", i);
-            // Additionally, you can get certain gamepad properties like:
-            // Model, VID, PID, BTAddr, flags, etc.
             ControllerProperties properties = ctl->getProperties();
             Console.printf("Controller model: %s, VID=0x%04x, PID=0x%04x\n", ctl->getModelName(), properties.vendor_id,
                            properties.product_id);
@@ -60,158 +333,153 @@ void onDisconnectedController(ControllerPtr ctl) {
     if (!foundController) {
         Console.println("CALLBACK: Controller disconnected, but not found in myControllers");
     }
+    if (ctl->getModelName() == "Wii") {
+        currentTiltDegrees = 0.0f;
+        systemEnabled = false;  
+        leanModeEnabled = false;
+    }
+    resetMotorOutput();
 }
 
 void dumpGamepad(ControllerPtr ctl) {
     Console.printf(
         "idx=%d, dpad: 0x%02x, buttons: 0x%04x, axis L: %4d, %4d, axis R: %4d, %4d, brake: %4d, throttle: %4d, "
         "misc: 0x%02x, gyro x:%6d y:%6d z:%6d, accel x:%6d y:%6d z:%6d\n",
-        ctl->index(),        // Controller Index
-        ctl->dpad(),         // D-pad
-        ctl->buttons(),      // bitmask of pressed buttons
-        ctl->axisX(),        // (-511 - 512) left X Axis
-        ctl->axisY(),        // (-511 - 512) left Y axis
-        ctl->axisRX(),       // (-511 - 512) right X axis
-        ctl->axisRY(),       // (-511 - 512) right Y axis
-        ctl->brake(),        // (0 - 1023): brake button
-        ctl->throttle(),     // (0 - 1023): throttle (AKA gas) button
-        ctl->miscButtons(),  // bitmask of pressed "misc" buttons
-        ctl->gyroX(),        // Gyro X
-        ctl->gyroY(),        // Gyro Y
-        ctl->gyroZ(),        // Gyro Z
-        ctl->accelX(),       // Accelerometer X
-        ctl->accelY(),       // Accelerometer Y
-        ctl->accelZ()        // Accelerometer Z
-    );
+        ctl->index(), ctl->dpad(), ctl->buttons(), ctl->axisX(), ctl->axisY(), ctl->axisRX(), ctl->axisRY(),
+        ctl->brake(), ctl->throttle(), ctl->miscButtons(), ctl->gyroX(), ctl->gyroY(), ctl->gyroZ(),
+        ctl->accelX(), ctl->accelY(), ctl->accelZ());
+}
+
+float getWiiRemoteTilt(ControllerPtr ctl) {
+    // Note: If holding the Wii Remote horizontally like a steering wheel (D-pad on left, 1/2 on right),
+    // roll angle uses accelY and accelZ: atan2f(accelY, accelZ).
+    // If pointing it forward like a TV remote, roll angle uses accelX and accelZ: atan2f(accelX, accelZ).
+    const float accelZ = static_cast<float>(ctl->accelZ());
+    const float accelX = static_cast<float>(ctl->accelX());
+
+    return atan2f(accelZ, accelX) * 57.2957795f;
+}
+
+void dumpWiiRemoteTilt(ControllerPtr ctl) {
+    const MotorPulses pulses = computeActivePulses();
+    Console.printf("Wii remote idx=%d, tilt=%.1f deg, pwm_L=%lu us, pwm_R=%lu us, accel_x=%d, accel_y=%d, accel_z=%d\n",
+                   ctl->index(), currentTiltDegrees,
+                   static_cast<unsigned long>(pulses.leftUs),
+                   static_cast<unsigned long>(pulses.rightUs),
+                   ctl->accelX(), ctl->accelY(), ctl->accelZ());
 }
 
 void dumpMouse(ControllerPtr ctl) {
     Console.printf("idx=%d, buttons: 0x%04x, scrollWheel=0x%04x, delta X: %4d, delta Y: %4d\n",
-                   ctl->index(),        // Controller Index
-                   ctl->buttons(),      // bitmask of pressed buttons
-                   ctl->scrollWheel(),  // Scroll Wheel
-                   ctl->deltaX(),       // (-511 - 512) left X Axis
-                   ctl->deltaY()        // (-511 - 512) left Y axis
-    );
+                   ctl->index(), ctl->buttons(), ctl->scrollWheel(), ctl->deltaX(), ctl->deltaY());
 }
 
 void dumpKeyboard(ControllerPtr ctl) {
     static const char* key_names[] = {
-        // clang-format off
-        // To avoid having too much noise in this file, only a few keys are mapped to strings.
-        // Starts with "A", which is offset 4.
         "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V",
         "W", "X", "Y", "Z", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
-        // Special keys
         "Enter", "Escape", "Backspace", "Tab", "Spacebar", "Underscore", "Equal", "OpenBracket", "CloseBracket",
         "Backslash", "Tilde", "SemiColon", "Quote", "GraveAccent", "Comma", "Dot", "Slash", "CapsLock",
-        // Function keys
         "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
-        // Cursors and others
         "PrintScreen", "ScrollLock", "Pause", "Insert", "Home", "PageUp", "Delete", "End", "PageDown",
         "RightArrow", "LeftArrow", "DownArrow", "UpArrow",
-        // clang-format on
     };
     static const char* modifier_names[] = {
-        // clang-format off
-        // From 0xe0 to 0xe7
         "Left Control", "Left Shift", "Left Alt", "Left Meta",
         "Right Control", "Right Shift", "Right Alt", "Right Meta",
-        // clang-format on
     };
     Console.printf("idx=%d, Pressed keys: ", ctl->index());
     for (int key = Keyboard_A; key <= Keyboard_UpArrow; key++) {
         if (ctl->isKeyPressed(static_cast<KeyboardKey>(key))) {
-            const char* keyName = key_names[key - 4];
-            Console.printf("%s,", keyName);
+            Console.printf("%s,", key_names[key - 4]);
         }
     }
     for (int key = Keyboard_LeftControl; key <= Keyboard_RightMeta; key++) {
         if (ctl->isKeyPressed(static_cast<KeyboardKey>(key))) {
-            const char* keyName = modifier_names[key - 0xe0];
-            Console.printf("%s,", keyName);
+            Console.printf("%s,", modifier_names[key - 0xe0]);
         }
     }
     Console.printf("\n");
 }
 
 void dumpBalanceBoard(ControllerPtr ctl, uint32_t topLeft, uint32_t topRight, uint32_t bottomLeft,
-                      uint32_t bottomRight, const char* lean) {
+                      uint32_t bottomRight, const char* lean, const char* lastStep, uint32_t steps,
+                      uint8_t stepsInWindow, MotorPulses pulses, bool stepEvent, bool balanceBoardOccupied) {
+    if (!shouldPrintControllerMonitor(ctl, stepEvent)) {
+        return;
+    }
+
     const uint32_t left = topLeft + bottomLeft;
     const uint32_t right = topRight + bottomRight;
     const uint32_t front = topLeft + topRight;
     const uint32_t back = bottomLeft + bottomRight;
     const uint32_t total = topLeft + topRight + bottomLeft + bottomRight;
 
-    Console.printf("idx=%d, TL=%u g, TR=%u g, BL=%u g, BR=%u g, total=%lu g, left=%lu g, right=%lu g, front=%lu g, back=%lu g, lean=%s, temperature=%d\n",
-                   ctl->index(), static_cast<unsigned>(topLeft), static_cast<unsigned>(topRight),
-                   static_cast<unsigned>(bottomLeft), static_cast<unsigned>(bottomRight),
-                   static_cast<unsigned long>(total), static_cast<unsigned long>(left),
-                   static_cast<unsigned long>(right), static_cast<unsigned long>(front),
-                   static_cast<unsigned long>(back), lean, ctl->temperature());
+    Console.printf(
+        "idx=%d, total=%lu g, left=%lu g (%u%%), right=%lu g (%u%%), front=%lu g, back=%lu g, "
+        "lean=%s, last_step=%s, steps=%lu, steps_2s=%u, speed_level=%u, tilt=%.1f deg, pwm_L=%lu us, pwm_R=%lu us, boardOccupied=%lu\n",
+        ctl->index(), static_cast<unsigned long>(total), static_cast<unsigned long>(left),
+        static_cast<unsigned>(total ? left * 100 / total : 0),
+        static_cast<unsigned long>(right), static_cast<unsigned>(total ? right * 100 / total : 0),
+        static_cast<unsigned long>(front), static_cast<unsigned long>(back), lean, lastStep,
+        static_cast<unsigned long>(steps), static_cast<unsigned>(stepsInWindow),
+        static_cast<unsigned>(currentSpeedLevel), currentTiltDegrees,
+        static_cast<unsigned long>(pulses.leftUs), static_cast<unsigned long>(pulses.rightUs), balanceBoardOccupied);
 }
 
 void processGamepad(ControllerPtr ctl) {
-    // There are different ways to query whether a button is pressed.
-    // By query each button individually:
-    //  a(), b(), x(), y(), l1(), etc...
+    if (ctl->getModelName() == "Wii") {
+        currentTiltDegrees = getWiiRemoteTilt(ctl);
+        static bool prevButton2Pressed = false;
+        const bool button2Pressed = ctl->b();  // Wii Remote '2' button maps to y()
+        if (button2Pressed && !prevButton2Pressed) {
+            systemEnabled = !systemEnabled;
+            Console.printf("System %s\n", systemEnabled ? "ENABLED" : "DISABLED");
+            if (!systemEnabled) {
+                resetMotorOutput();
+            }
+        }
+        prevButton2Pressed = button2Pressed;
+
+        static bool prevButton1Pressed = false;
+        const bool button1Pressed = ctl->a();  // Wii Remote '1' button
+        if (button1Pressed && !prevButton1Pressed) {
+            leanModeEnabled = !leanModeEnabled;
+            resetMotorOutput();
+            Console.printf("Mode switched to %s\n", leanModeEnabled ? "LEAN MODE" : "STEP MODE");
+        }
+        prevButton1Pressed = button1Pressed;
+    }
     if (ctl->a()) {
         static int colorIdx = 0;
-        // Some gamepads like DS4 and DualSense support changing the color LED.
-        // It is possible to change it by calling:
         switch (colorIdx % 3) {
-            case 0:
-                // Red
-                ctl->setColorLED(255, 0, 0);
-                break;
-            case 1:
-                // Green
-                ctl->setColorLED(0, 255, 0);
-                break;
-            case 2:
-                // Blue
-                ctl->setColorLED(0, 0, 255);
-                break;
+            case 0: ctl->setColorLED(255, 0, 0); break;
+            case 1: ctl->setColorLED(0, 255, 0); break;
+            case 2: ctl->setColorLED(0, 0, 255); break;
         }
         colorIdx++;
     }
 
     if (ctl->b()) {
-        // Turn on the 4 LED. Each bit represents one LED.
         static int led = 0;
         led++;
-        // Some gamepads like the DS3, DualSense, Nintendo Wii, Nintendo Switch
-        // support changing the "Player LEDs": those 4 LEDs that usually indicate
-        // the "gamepad seat".
-        // It is possible to change them by calling:
         ctl->setPlayerLEDs(led & 0x0f);
     }
 
     if (ctl->x()) {
-        // Some gamepads like DS3, DS4, DualSense, Switch, Xbox One S, Stadia support rumble.
-        // It is possible to set it by calling:
-        // Some controllers have two motors: "strong motor", "weak motor".
-        // It is possible to control them independently.
-        ctl->playDualRumble(0 /* delayedStartMs */, 250 /* durationMs */, 0x80 /* weakMagnitude */,
-                            0x40 /* strongMagnitude */);
+        ctl->playDualRumble(0, 250, 0x80, 0x40);
     }
 
-    // Another way to query controller data is by getting the buttons() function.
-    // See how the different "dump*" functions dump the Controller info.
-    dumpGamepad(ctl);
-
-    // See ArduinoController.h for all the available functions.
+    if (shouldPrintControllerMonitor(ctl)) {
+        if (ctl->getModelName() == "Wii") {
+            dumpWiiRemoteTilt(ctl);
+        } else {
+            dumpGamepad(ctl);
+        }
+    }
 }
 
 void processMouse(ControllerPtr ctl) {
-    // This is just an example.
-    if (ctl->scrollWheel() > 0) {
-        // Do Something
-    } else if (ctl->scrollWheel() < 0) {
-        // Do something else
-    }
-
-    // See "dumpMouse" for possible things to query.
     dumpMouse(ctl);
 }
 
@@ -219,43 +487,39 @@ void processKeyboard(ControllerPtr ctl) {
     if (!ctl->isAnyKeyPressed())
         return;
 
-    // This is just an example.
     if (ctl->isKeyPressed(Keyboard_A)) {
-        // Do Something
         Console.println("Key 'A' pressed");
     }
-
-    // Don't do "else" here.
-    // Multiple keys can be pressed at the same time.
     if (ctl->isKeyPressed(Keyboard_LeftShift)) {
-        // Do something else
         Console.println("Key 'LEFT SHIFT' pressed");
     }
-
-    // Don't do "else" here.
-    // Multiple keys can be pressed at the same time.
     if (ctl->isKeyPressed(Keyboard_LeftArrow)) {
-        // Do something else
         Console.println("Key 'Left Arrow' pressed");
     }
 
-    // See "dumpKeyboard" for possible things to query.
     dumpKeyboard(ctl);
 }
 
 void processBalanceBoard(ControllerPtr ctl) {
     constexpr uint32_t minimumLoadGrams = 300;
     constexpr uint32_t minimumDeadzoneGrams = 200;
+    const uint32_t now = millis();
+    lastBalanceBoardDataAt = now;
+
     static bool initialized = false;
     static uint32_t topLeft = 0;
     static uint32_t topRight = 0;
     static uint32_t bottomLeft = 0;
     static uint32_t bottomRight = 0;
-
     const uint32_t rawTopLeft = ctl->topLeft();
     const uint32_t rawTopRight = ctl->topRight();
     const uint32_t rawBottomLeft = ctl->bottomLeft();
     const uint32_t rawBottomRight = ctl->bottomRight();
+    const uint32_t rawLeft = rawTopLeft + rawBottomLeft;
+    const uint32_t rawRight = rawTopRight + rawBottomRight;
+    const uint32_t rawTotal = rawLeft + rawRight;
+    const uint32_t rawLeftPercent = rawTotal ? rawLeft * 100 / rawTotal : 0;
+    const uint32_t rawRightPercent = rawTotal ? rawRight * 100 / rawTotal : 0;
 
     if (!initialized) {
         topLeft = rawTopLeft;
@@ -278,13 +542,14 @@ void processBalanceBoard(ControllerPtr ctl) {
     const int32_t leftRightShift = static_cast<int32_t>(right) - static_cast<int32_t>(left);
     const int32_t frontBackShift = static_cast<int32_t>(front) - static_cast<int32_t>(back);
     const uint32_t deadzone = total / 8 > minimumDeadzoneGrams ? total / 8 : minimumDeadzoneGrams;
+    const uint32_t frontBackDeadzone = deadzone * 115 / 100;
     const int32_t leftRightMagnitude = leftRightShift < 0 ? -leftRightShift : leftRightShift;
     const int32_t frontBackMagnitude = frontBackShift < 0 ? -frontBackShift : frontBackShift;
 
     const char* lean = "NO LOAD";
     if (total >= minimumLoadGrams) {
         if (leftRightMagnitude <= static_cast<int32_t>(deadzone) &&
-            frontBackMagnitude <= static_cast<int32_t>(deadzone)) {
+            frontBackMagnitude <= static_cast<int32_t>(frontBackDeadzone)) {
             lean = "CENTER";
         } else if (leftRightMagnitude >= frontBackMagnitude) {
             lean = leftRightShift > 0 ? "RIGHT" : "LEFT";
@@ -293,7 +558,61 @@ void processBalanceBoard(ControllerPtr ctl) {
         }
     }
 
-    dumpBalanceBoard(ctl, topLeft, topRight, bottomLeft, bottomRight, lean);
+    const char* lastStep = "NONE";
+    bool stepEvent = false;
+    if (!systemEnabled || rawTotal < kMinimumStepLoadGrams) {
+        resetMotorOutput();
+        lastBalanceBoardDataAt = now;
+        lastStep = "NO LOAD";
+        balanceBoardOccupied = false;
+    } else {balanceBoardOccupied = true;
+        balanceBoardOccupied = true;
+        if (leanModeEnabled) {
+            // Proportional front/back throttle outside frontBackDeadzone
+            const int32_t maxFrontBackShift = static_cast<int32_t>(total / 2);
+            if (frontBackMagnitude <= static_cast<int32_t>(frontBackDeadzone) ||
+                maxFrontBackShift <= static_cast<int32_t>(frontBackDeadzone)) {
+                leanFrontBackOffsetUs = 0;
+            } else {
+                const int32_t effectiveShift = frontBackMagnitude - static_cast<int32_t>(frontBackDeadzone);
+                const int32_t effectiveSpan = maxFrontBackShift - static_cast<int32_t>(frontBackDeadzone);
+                const int32_t signedOffset = constrain(
+                    effectiveShift * kMaxLeanThrottleOffsetUs / effectiveSpan, 0, kMaxLeanThrottleOffsetUs);
+                leanFrontBackOffsetUs = frontBackShift > 0 ? signedOffset : -signedOffset;
+            }
+
+            // Proportional left/right differential turn outside deadzone
+            const int32_t maxLeftRightShift = static_cast<int32_t>(total / 2);
+            if (leftRightMagnitude <= static_cast<int32_t>(deadzone) ||
+                maxLeftRightShift <= static_cast<int32_t>(deadzone)) {
+                leanLeftRightOffsetUs = 0;
+            } else {
+                const int32_t effectiveShift = leftRightMagnitude - static_cast<int32_t>(deadzone);
+                const int32_t effectiveSpan = maxLeftRightShift - static_cast<int32_t>(deadzone);
+                const int32_t signedOffset = constrain(
+                    effectiveShift * kMaxLeanSteeringOffsetUs / effectiveSpan, 0, kMaxLeanSteeringOffsetUs);
+                leanLeftRightOffsetUs = leftRightShift > 0 ? signedOffset : -signedOffset;
+            }
+        } else {
+            if (rawLeftPercent >= kStepSidePercent && lastCountedSide != DominantSide::Left) {
+                lastCountedSide = DominantSide::Left;
+                recordStep(now);
+                lastStep = "LEFT";
+                stepEvent = true;
+            } else if (rawRightPercent >= kStepSidePercent && lastCountedSide != DominantSide::Right) {
+                lastCountedSide = DominantSide::Right;
+                recordStep(now);
+                lastStep = "RIGHT";
+                stepEvent = true;
+            }
+            updateMotorSpeed(now, countRecentSteps(now)*2);
+        }
+    }
+
+    const uint8_t stepsInWindow = countRecentSteps(now);
+    const MotorPulses outputPulses = computeActivePulses();
+    dumpBalanceBoard(ctl, topLeft, topRight, bottomLeft, bottomRight, lean, lastStep, totalStepCount,
+                     stepsInWindow, outputPulses, stepEvent, balanceBoardOccupied);
 }
 
 void processControllers() {
@@ -312,51 +631,30 @@ void processControllers() {
             }
         }
     }
+    writeMotorPulses(computeActivePulses());
 }
 
-// Arduino setup function. Runs in CPU 1
 void setup() {
+    setupMotorPwm();
     Console.printf("Firmware: %s\n", BP32.firmwareVersion());
     const uint8_t* addr = BP32.localBdAddress();
     Console.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
-    // Setup the Bluepad32 callbacks, and the default behavior for scanning or not.
-    // By default, if the "startScanning" parameter is not passed, it will do the "start scanning".
-    // Notice that "Start scanning" will try to auto-connect to devices that are compatible with Bluepad32.
-    // E.g: if a Gamepad, keyboard or mouse are detected, it will try to auto connect to them.
     bool startScanning = true;
     BP32.setup(&onConnectedController, &onDisconnectedController, startScanning);
-
-    // Notice that scanning can be stopped / started at any time by calling:
-    // BP32.enableNewBluetoothConnections(enabled);
-
-    // Enables mouse / touchpad support for gamepads that support them.
-    // When enabled, controllers like DualSense and DualShock4 generate two connected devices:
-    // - First one: the gamepad
-    // - Second one, which is a "virtual device", is a mouse.
-    // By default, it is disabled.
     BP32.enableVirtualDevice(false);
-
-    // Enables the BLE Service in Bluepad32.
-    // This service allows clients, like a mobile app, to setup and see the state of Bluepad32.
-    // By default, it is disabled.
     BP32.enableBLEService(false);
+    registerPwmTestConsoleCommand();
 }
 
-// Arduino loop function. Runs in CPU 1.
 void loop() {
-    // This call fetches all the controllers' data.
-    // Call this function in your main loop.
     bool dataUpdated = BP32.update();
     if (dataUpdated)
         processControllers();
 
-    // The main loop must have some kind of "yield to lower priority task" event.
-    // Otherwise, the watchdog will get triggered.
-    // If your main loop doesn't have one, just add a simple `vTaskDelay(1)`.
-    // Detailed info here:
-    // https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
+    if (lastBalanceBoardDataAt != 0 && millis() - lastBalanceBoardDataAt > kBalanceBoardTimeoutMs) {
+        resetMotorOutput();
+    }
 
-    //     vTaskDelay(1);
-    delay(150);
+    delay(20);
 }
