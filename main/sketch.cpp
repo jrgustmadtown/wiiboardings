@@ -9,23 +9,23 @@
 #include <esp_console.h>
 #include <math.h>
 
-constexpr uint8_t kStatusLedPin = 48;  // Change to your LED GPIO (e.g., 48 or 38 on ESP32-S3, or any free GPIO like 13)
+// constexpr uint8_t kStatusLedPin = 48;  // Change to your LED GPIO (e.g., 48 or 38 on ESP32-S3, or any free GPIO like 13)
 
-void updateStatusLed() {
-    static uint32_t lastLedUpdate = 0;
-    if (millis() - lastLedUpdate < 50) {
-        return;
-    }
-    lastLedUpdate = millis();
+// void updateStatusLed() {
+//     static uint32_t lastLedUpdate = 0;
+//     if (millis() - lastLedUpdate < 50) {
+//         return;
+//     }
+//     lastLedUpdate = millis();
 
-    if (!systemEnabled) {
-        neopixelWrite(kStatusLedPin, 40, 0, 0);      // Dim Red = Disarmed / Off
-    } else if (leanModeEnabled) {
-        neopixelWrite(kStatusLedPin, 0, 60, 150);    // Blue = Armed (Lean Mode)
-    } else {
-        neopixelWrite(kStatusLedPin, 0, 150, 20);    // Green = Armed (Step Mode)
-    }
-}
+//     if (!systemEnabled) {
+//         neopixelWrite(kStatusLedPin, 40, 0, 0);      // Dim Red = Disarmed / Off
+//     } else if (leanModeEnabled) {
+//         neopixelWrite(kStatusLedPin, 0, 60, 150);    // Blue = Armed (Lean Mode)
+//     } else {
+//         neopixelWrite(kStatusLedPin, 0, 150, 20);    // Green = Armed (Step Mode)
+//     }
+// }
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
@@ -674,7 +674,7 @@ void loop() {
         resetMotorOutput();
     }
 
-    updateStatusLed();
+    // updateStatusLed();
 
     delay(20);
 }
